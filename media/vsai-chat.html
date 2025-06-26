@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>AI CODE FIX</title>
+  <style>
+    body {
+      background: #222;
+      color: #eee;
+      font-family: monospace, 'Segoe UI', 'Fira Code', 'Menlo', sans-serif;
+      margin: 0;
+      padding: 0;
+    }
+    .container {
+      margin: 24px;
+      max-width: 600px;
+      min-width: 150px;
+    }
+    .filename {
+      font-size: 1em;
+      margin-bottom: 12px;
+      font-weight: bold;
+    }
+    .actions {
+      margin: 16px 0;
+      display: flex;
+      gap: 12px;
+    }
+    button {
+      padding: 8px 18px;
+      font-size: 1em;
+      border: 1px solid #444;
+      background: #333;
+      color: #eee;
+      border-radius: 0;
+      cursor: pointer;
+    }
+    button:active {
+      background: #444;
+    }
+    pre.code-block {
+      background: #181818;
+      color: #eee;
+      padding: 12px;
+      font-size: 1em;
+      margin: 0 0 12px 0;
+      border: 1px solid #444;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+    .removed-line {
+      background: #2a1a1a;
+      color: #ffb3b3;
+      display: block;
+    }
+    .added-line {
+      background: #1a2a1a;
+      color: #b3ffb3;
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="filename" id="filename"></div>
+    <div class="actions" id="fixActions">
+      <button onclick="onFixClick()">Fix Selected Code</button>
+    </div>
+    <pre class="code-block" id="diff" style="display:none;"></pre>
+    <div class="actions" id="diffActions" style="display:none;">
+      <button onclick="applyFix()">Accept</button>
+      <button onclick="rejectFix()">Reject</button>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/diff@5.1.0/dist/diff.min.js"></script>
+  <script>
+    const vscode = acquireVsCodeApi();
+    let fixedCode = '';
+    function onFixClick() {
+      document.getElementById('diff').style.display = 'none';
+      document.getElementById('diffActions').style.display = 'none';
+      document.getElementById('fixActions').style.display = 'none';
+      document.getElementById('filename').innerText = '';
+      vscode.postMessage({ type: 'fix-request' });
+    }
+    function formatSimpleDiff(original, fixed) {
+      const diff = Diff.diffLines(original, fixed);
+      let html = '';
+      diff.forEach(part => {
+        if (part.removed) {
+          part.value.split('\n').forEach(line => {
+            if (line) html += `<span class='removed-line'>- ${line}</span>\n`;
+          });
+        } else if (part.added) {
+          part.value.split('\n').forEach(line => {
+            if (line) html += `<span class='added-line'>+ ${line}</span>\n`;
+          });
+        } else {
+          part.value.split('\n').forEach(line => {
+            if (line) html += line + '\n';
+          });
+        }
+      });
+      return html;
+    }
+    window.addEventListener('message', event => {
+      const message = event.data;
+      if (message.type === 'show-diff') {
+        document.getElementById('filename').innerText = message.filename || '';
+        fixedCode = message.fixed;
+        document.getElementById('diff').innerHTML = formatSimpleDiff(message.original, message.fixed);
+        document.getElementById('diff').style.display = 'block';
+        document.getElementById('diffActions').style.display = 'flex';
+        document.getElementById('fixActions').style.display = 'none';
+      }
+      if (message.type === 'fix-applied') {
+        document.getElementById('diff').style.display = 'none';
+        document.getElementById('diffActions').style.display = 'none';
+        document.getElementById('fixActions').style.display = 'flex';
+      }
+      if (message.type === 'fix-error') {
+        alert('Error applying fix: ' + message.error);
+        document.getElementById('diff').style.display = 'none';
+        document.getElementById('diffActions').style.display = 'none';
+        document.getElementById('fixActions').style.display = 'flex';
+      }
+    });
+    function applyFix() {
+      vscode.postMessage({ type: 'apply-fix', fixed: fixedCode });
+    }
+    function rejectFix() {
+      document.getElementById('diff').style.display = 'none';
+      document.getElementById('diffActions').style.display = 'none';
+      document.getElementById('fixActions').style.display = 'flex';
+    }
+  </script>
+</body>
+</html>
