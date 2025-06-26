@@ -41,8 +41,58 @@ const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const axios_1 = __importDefault(require("axios"));
+// @ts-ignore
+const x402_axios_1 = require("x402-axios");
+const accounts_1 = require("viem/accounts");
+const viem_1 = require("viem");
+const chains_1 = require("viem/chains");
+const baseURL = process.env.RESOURCE_SERVER_URL || 'http://localhost:3001';
+const endpointPath = process.env.ENDPOINT_PATH || '/gpt';
+const USDC_ADDRESS = '0x036CbD53842c5426634e7929541eC2318f3dCF7e';
+const USDC_ABI = [
+    {
+        "constant": true,
+        "inputs": [{ "name": "account", "type": "address" }],
+        "name": "balanceOf",
+        "outputs": [{ "name": "", "type": "uint256" }],
+        "type": "function"
+    },
+    {
+        "constant": true,
+        "inputs": [],
+        "name": "decimals",
+        "outputs": [{ "name": "", "type": "uint8" }],
+        "type": "function"
+    }
+];
 function activate(context) {
     vscode.window.showInformationMessage('VS AI Minimal extension activated!');
+    // Key for secret storage
+    const SECRET_KEY = 'vsai-private-key';
+    let currentPrivateKey;
+    let currentAccount = undefined;
+    let currentApi = undefined;
+    async function updateAccountAndApi(privateKey) {
+        // @ts-ignore
+        const account = (0, accounts_1.privateKeyToAccount)(privateKey);
+        // @ts-ignore
+        const api = (0, x402_axios_1.withPaymentInterceptor)(axios_1.default.create({ baseURL }), account);
+        currentPrivateKey = privateKey;
+        currentAccount = account;
+        currentApi = api;
+    }
+    // On activation, load private key from secret storage
+    context.secrets.get(SECRET_KEY).then(storedKey => {
+        if (storedKey) {
+            updateAccountAndApi(storedKey);
+        }
+        else {
+            // Set default hardcoded private key if not present
+            const defaultKey = '';
+            context.secrets.store(SECRET_KEY, defaultKey);
+            updateAccountAndApi(defaultKey);
+        }
+    });
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('vsai-chat-view', {
         resolveWebviewView(webviewView) {
             webviewView.webview.options = { enableScripts: true };
@@ -61,6 +111,13 @@ function activate(context) {
                     .trim();
             }
             webviewView.webview.onDidReceiveMessage(async (message) => {
+                if (message.type === 'set-private-key') {
+                    const { privateKey, address } = message;
+                    await context.secrets.store(SECRET_KEY, privateKey);
+                    updateAccountAndApi(privateKey);
+                    vscode.window.showInformationMessage('Private key set! Address: ' + address);
+                    return;
+                }
                 if (message.type === 'fix-request') {
                     const editor = vscode.window.activeTextEditor;
                     if (!editor) {
@@ -208,9 +265,15 @@ function activate(context) {
                         selectedModel = models[models.length - 1];
                         if (contextTokens >= selectedModel.maxTokens) {
                             // Trim context
-                            const words = contextCode.split(/\s+/);
-                            contextCode = words.slice(0, Math.floor(selectedModel.maxTokens / 1.3)).join(' ');
-                            contextTokens = estimateTokens(contextCode);
+                            if (typeof contextCode === 'string') {
+                                const words = contextCode.split(/\s+/);
+                                contextCode = words.slice(0, Math.floor(selectedModel.maxTokens / 1.3)).join(' ');
+                                contextTokens = estimateTokens(contextCode);
+                            }
+                            else {
+                                contextCode = '';
+                                contextTokens = 0;
+                            }
                         }
                     }
                     // --- End model selection logic ---
@@ -222,24 +285,22 @@ function activate(context) {
                             `Fix and improve this ${language} file. Return only the fixed file, nothing else:\n${contextCode}`;
                     // --- End prompt construction ---
                     // --- Error handling and retry logic ---
-                    async function callOpenAI(model, prompt) {
-                        const OPENAI_API_KEY = '';
-                        return axios_1.default.post('https://api.openai.com/v1/chat/completions', {
+                    async function callOpenAI(model, prompt, price) {
+                        if (!currentApi) {
+                            throw new Error('No private key set. Please set your private key in the Wallet Settings.');
+                        }
+                        const response = await currentApi.post(endpointPath, {
                             model,
-                            messages: [
-                                { role: 'system', content: 'You are an expert programmer.' },
-                                { role: 'user', content: prompt }
-                            ]
-                        }, {
-                            headers: {
-                                'Authorization': `Bearer ${OPENAI_API_KEY}`,
-                                'Content-Type': 'application/json'
-                            }
+                            prompt,
+                            price
                         });
+                        const paymentResponse = (0, x402_axios_1.decodeXPaymentResponse)(response.headers["x-payment-response"]);
+                        console.log(paymentResponse);
+                        return response;
                     }
                     let response;
                     try {
-                        response = await callOpenAI(selectedModel.name, prompt);
+                        response = await callOpenAI(selectedModel.name, prompt, selectedModel.cost);
                     }
                     catch (err) {
                         // If context length error, try next bigger model or trim
@@ -247,18 +308,23 @@ function activate(context) {
                             if (selectedModel.name !== models[models.length - 1].name) {
                                 // Try largest model
                                 selectedModel = models[models.length - 1];
-                                response = await callOpenAI(selectedModel.name, prompt);
+                                response = await callOpenAI(selectedModel.name, prompt, selectedModel.cost);
                             }
                             else {
                                 // Trim context and retry
-                                const words = contextCode.split(/\s+/);
-                                contextCode = words.slice(0, Math.floor(selectedModel.maxTokens / 1.3)).join(' ');
+                                if (typeof contextCode === 'string') {
+                                    const words = contextCode.split(/\s+/);
+                                    contextCode = words.slice(0, Math.floor(selectedModel.maxTokens / 1.3)).join(' ');
+                                }
+                                else {
+                                    contextCode = '';
+                                }
                                 const newPrompt = contextType === 'line' ?
                                     `Fix and improve this line of ${language} code. Return only the fixed line, nothing else:\n${contextCode}` :
                                     contextType === 'function/class' ?
                                         `Fix and improve this ${language} function or class. Return only the fixed code, nothing else:\n${contextCode}` :
                                         `Fix and improve this ${language} file. Return only the fixed file, nothing else:\n${contextCode}`;
-                                response = await callOpenAI(selectedModel.name, newPrompt);
+                                response = await callOpenAI(selectedModel.name, newPrompt, selectedModel.cost);
                             }
                         }
                         else {
@@ -280,6 +346,39 @@ function activate(context) {
                     else {
                         webviewView.webview.postMessage({ type: 'fix-error', error: 'No selection to apply fix.' });
                     }
+                }
+                if (message.type === 'get-wallet-info') {
+                    let address = currentAccount?.address;
+                    let usdcBalance = '-';
+                    if (address) {
+                        try {
+                            const client = (0, viem_1.createPublicClient)({ chain: chains_1.baseSepolia, transport: (0, viem_1.http)() });
+                            // Get decimals
+                            const decimals = BigInt(await client.readContract({
+                                address: USDC_ADDRESS,
+                                abi: USDC_ABI,
+                                functionName: 'decimals',
+                            }));
+                            // Get balance
+                            const balance = BigInt(await client.readContract({
+                                address: USDC_ADDRESS,
+                                abi: USDC_ABI,
+                                functionName: 'balanceOf',
+                                args: [address],
+                            }));
+                            // Show full decimals
+                            const decimalsNum = Number(decimals);
+                            const balanceStr = balance.toString().padStart(decimalsNum + 1, '0');
+                            const intPart = balanceStr.slice(0, balanceStr.length - decimalsNum) || '0';
+                            const decPart = balanceStr.slice(-decimalsNum).replace(/0+$/, '') || '0';
+                            usdcBalance = `${intPart}.${decPart}`;
+                        }
+                        catch (e) {
+                            usdcBalance = 'Error';
+                        }
+                    }
+                    webviewView.webview.postMessage({ type: 'wallet-info', address, usdcBalance });
+                    return;
                 }
             });
         }

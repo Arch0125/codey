@@ -93,7 +93,23 @@
       <button onclick="rejectFix()">Reject</button>
     </div>
   </div>
+  <div class="container" style="margin-top:32px; border-top:1px solid #444; padding-top:16px;">
+    <div style="font-size:1em; margin-bottom:8px; font-weight:bold;">Wallet Settings</div>
+    <label for="privateKeyInput" style="font-size:0.95em;">Private Key:</label>
+    <input id="privateKeyInput" type="password" style="width:80%;margin:8px 0;" placeholder="Enter your private key" />
+    <button onclick="onSetPrivateKey()">Set Private Key</button>
+    <div id="addressDisplay" style="margin-top:8px; color:#6f6; font-size:0.95em;"></div>
+    <div id="walletInfo" style="margin-top:8px; color:#6cf; font-size:0.95em;">
+      <span id="walletAddress"></span><br/>
+      <span id="usdcBalance">USDC Balance: <span id="usdcBalanceValue">-</span></span>
+      <button onclick="refreshBalance()" style="margin-left:8px;">Refresh Balance</button>
+    </div>
+    <div id="totalSavedSection" style="margin-top:12px; color:#6f6; font-size:0.95em;">
+      Total saved: $<span id="totalSavedValue">0.000000</span>
+    </div>
+  </div>
   <script src="https://cdn.jsdelivr.net/npm/diff@5.1.0/dist/diff.min.js"></script>
+  <script src="https://unpkg.com/viem/dist/viem.umd.js"></script>
   <script>
     const vscode = acquireVsCodeApi();
     let fixedCode = '';
@@ -131,6 +147,14 @@
       document.getElementById('loading').style.display = 'none';
     }
 
+    function setWalletInfo(address, usdcBalance) {
+      document.getElementById('walletAddress').innerText = address ? `Address: ${address}` : '';
+      document.getElementById('usdcBalanceValue').innerText = usdcBalance !== undefined ? usdcBalance : '-';
+    }
+    function refreshBalance() {
+      vscode.postMessage({ type: 'get-wallet-info' });
+    }
+
     window.addEventListener('message', event => {
       const msg = event.data;
       if (msg.type === 'show-diff') {
@@ -147,35 +171,65 @@
         const modelPrices = { 'gpt-3.5-turbo': 0.0005, 'gpt-3.5-turbo-16k': 0.001, 'gpt-4-turbo': 0.01, 'o4-mini-high': 0.00193, 'gpt-4o': 0.02 };
         const usedTokens = estimateTokens(document.getElementById('diff').innerText);
         const cost = (usedTokens / 1000) * (modelPrices[msg.model] || modelPrices['gpt-3.5-turbo']);
-        const fullCostGPT4 = (usedTokens * 3 / 1000) * modelPrices['gpt-4-turbo'];
-        const saved = Math.max(fullCostGPT4 - cost, 0);
-        let comparisonText = `You saved ~$${saved.toFixed(4)} vs full-file GPT-4 Turbo! 🎉`;
-
-        // compare to ChatGPT Plus subscription
-        const subscriptionCost = 20.00;
-        const diffSub = subscriptionCost - cost;
-        comparisonText += `\nCompared to ChatGPT Plus ($${subscriptionCost.toFixed(2)}/mo), you saved ~$${diffSub.toFixed(4)} this session! 🎉`;
-
-        // compare to SOTA API models on full context
-        const sotaModels = ['o4-mini-high', 'gpt-4o'];
-        sotaModels.forEach(m => {
-          const fullCost = (usedTokens * 3 / 1000) * modelPrices[m];
-          const diffModel = fullCost - cost;
-          if (diffModel > 0) comparisonText += `\nSaved ~$${diffModel.toFixed(4)} vs ${m} full-file context`;
-          else comparisonText += `\nCost $${cost.toFixed(4)} exceeds ${m} full-file context ($${fullCost.toFixed(4)})`;
-        });
-
-        document.getElementById('subscriptionComparison').innerText = comparisonText;
+        const costGpt4o = (usedTokens / 1000) * modelPrices['gpt-4o'];
+        const costO4Mini = (usedTokens / 1000) * modelPrices['o4-mini-high'];
+        let comparisonText = `Current cost: $${cost.toFixed(6)}\ngpt-4o: $${costGpt4o.toFixed(6)}\no4-mini-high: $${costO4Mini.toFixed(6)}`;
+        let savingsText = '';
+        const saveGpt4o = costGpt4o - cost;
+        const saveO4Mini = costO4Mini - cost;
+        let maxSave = Math.max(saveGpt4o, saveO4Mini, 0);
+        // Update total saved in localStorage
+        let totalSaved = parseFloat(localStorage.getItem('vsai_total_saved') || '0');
+        totalSaved += maxSave > 0 ? maxSave : 0;
+        localStorage.setItem('vsai_total_saved', totalSaved.toFixed(6));
+        document.getElementById('totalSavedValue').innerText = totalSaved.toFixed(6);
+        if (saveGpt4o > 0 && saveO4Mini > 0) {
+          savingsText = `\nYou save $${saveGpt4o.toFixed(6)} vs gpt-4o and $${saveO4Mini.toFixed(6)} vs o4-mini-high!`;
+        } else if (saveGpt4o > 0) {
+          savingsText = `\nYou save $${saveGpt4o.toFixed(6)} vs gpt-4o!`;
+        } else if (saveO4Mini > 0) {
+          savingsText = `\nYou save $${saveO4Mini.toFixed(6)} vs o4-mini-high!`;
+        } else {
+          savingsText = '\nNo savings compared to gpt-4o or o4-mini-high.';
+        }
+        document.getElementById('subscriptionComparison').innerText = comparisonText + savingsText;
       }
       if (msg.type === 'fix-applied' || msg.type === 'fix-error') {
         hideLoading();
         ['diff','diffActions'].forEach(id => document.getElementById(id).style.display = 'none');
         document.getElementById('fixActions').style.display = 'flex';
       }
+      if (msg.type === 'wallet-info') {
+        setWalletInfo(msg.address, msg.usdcBalance);
+      }
     });
 
     function applyFix() { vscode.postMessage({ type: 'apply-fix', fixed: fixedCode }); }
     function rejectFix() { document.getElementById('diff').style.display = 'none'; document.getElementById('diffActions').style.display = 'none'; document.getElementById('fixActions').style.display = 'flex'; }
+
+    function onSetPrivateKey() {
+      let pk = document.getElementById('privateKeyInput').value.trim();
+      if (!pk) {
+        document.getElementById('addressDisplay').innerText = 'Please enter a private key.';
+        return;
+      }
+      // Ensure 0x prefix
+      if (!pk.startsWith('0x')) pk = '0x' + pk;
+      try {
+        // viem is loaded globally as window.viem
+        const account = window.viem.accounts.privateKeyToAccount(pk);
+        document.getElementById('addressDisplay').innerText = 'Address: ' + account.address;
+        vscode.postMessage({ type: 'set-private-key', privateKey: pk, address: account.address });
+      } catch (e) {
+        document.getElementById('addressDisplay').innerText = 'Invalid private key.';
+      }
+    }
+
+    // On load, request wallet info
+    refreshBalance();
+
+    // On load, show total saved
+    document.getElementById('totalSavedValue').innerText = (localStorage.getItem('vsai_total_saved') || '0.000000');
   </script>
 </body>
 </html>
