@@ -3,17 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <title>AI CODE FIX</title>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet">
   <style>
     body {
       background: #222;
       color: #eee;
-      font-family: monospace, 'Segoe UI', 'Fira Code', 'Menlo', sans-serif;
+      font-family: 'Montserrat', monospace, sans-serif;
       margin: 0;
       padding: 0;
     }
     .container {
       margin: 24px;
-      max-width: 600px;
+      max-width: 250px;
       min-width: 150px;
     }
     .filename {
@@ -25,6 +26,7 @@
       margin: 16px 0;
       display: flex;
       gap: 12px;
+      width: 100%;
     }
     button {
       padding: 8px 18px;
@@ -34,6 +36,9 @@
       color: #eee;
       border-radius: 0;
       cursor: pointer;
+      font-weight: 600;
+      width: 100%;  
+      font-family: 'Montserrat', monospace, sans-serif;
     }
     button:active {
       background: #444;
@@ -47,6 +52,7 @@
       border: 1px solid #444;
       overflow-x: auto;
       white-space: pre-wrap;
+      font-family: 'Fira Mono', 'Fira Code', 'Menlo', 'Consolas', monospace;
     }
     .removed-line {
       background: #2a1a1a;
@@ -71,14 +77,40 @@
       0% { transform: rotate(0deg); }
       100% { transform: rotate(360deg); }
     }
+    .context-radios input[type="radio"] {
+      accent-color: #bbb;
+      width: 18px;
+      height: 18px;
+      margin-right: 8px;
+      background: #bbb;
+      border-radius: 50%;
+      border: 1.5px solid #bbb;
+      transition: accent-color 0.2s, background 0.2s;
+    }
+    .context-radios input[type="radio"]:checked {
+      accent-color: #bbb;
+      background: #bbb;
+      border-color: #bbb;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="filename" id="filename"></div>
     <div id="contextInfo" style="font-size:0.95em;color:#aaa;margin-bottom:8px;"></div>
+    <div id="priceInfo" style="font-size:0.95em;color:#bbb;margin-bottom:8px;font-family:'Montserrat',monospace,sans-serif;"></div>
     <div id="savingsInfo" style="font-size:0.95em;color:#6f6;margin-bottom:8px;"></div>
     <div id="subscriptionComparison" style="font-size:0.95em;color:#6f6;white-space:pre-wrap;margin-bottom:8px;"></div>
+
+    <div style="margin-bottom:10px;">
+      <div style="font-size:0.95em; font-weight:bold; margin-bottom:4px;">Context Window:</div>
+      <div style="display: flex; flex-direction: column; gap: 2px; ">
+        <label style="font-size:0.95em;"><input type="radio" name="contextWindow" value="line" checked> Line</label>
+        <label style="font-size:0.95em;"><input type="radio" name="contextWindow" value="function"> Parent Function/Class</label>
+        <label style="font-size:0.95em;"><input type="radio" name="contextWindow" value="file"> Full File</label>
+        <label style="font-size:0.95em;"><input type="radio" name="contextWindow" value="selection"> Selection</label>
+      </div>
+    </div>
 
     <div id="loading" style="display:none;align-items:center;gap:10px;margin:16px 0;">
       <span class="spinner"></span>
@@ -96,13 +128,13 @@
   <div class="container" style="margin-top:32px; border-top:1px solid #444; padding-top:16px;">
     <div style="font-size:1em; margin-bottom:8px; font-weight:bold;">Wallet Settings</div>
     <label for="privateKeyInput" style="font-size:0.95em;">Private Key:</label>
-    <input id="privateKeyInput" type="password" style="width:80%;margin:8px 0;" placeholder="Enter your private key" />
+    <input id="privateKeyInput" type="password" style="width:100%; background: #242424; border: #ffffff; border-width: 1px; padding-top: 8px; padding-bottom: 8px; margin-top: 8px; margin-bottom: 8px; " placeholder="Enter your private key" />
     <button onclick="onSetPrivateKey()">Set Private Key</button>
     <div id="addressDisplay" style="margin-top:8px; color:#6f6; font-size:0.95em;"></div>
-    <div id="walletInfo" style="margin-top:8px; color:#6cf; font-size:0.95em;">
+    <div id="walletInfo" style="margin-top:8px; color:#6cf; font-size:0.95em; gap: 2;">
       <span id="walletAddress"></span><br/>
-      <span id="usdcBalance">USDC Balance: <span id="usdcBalanceValue">-</span></span>
-      <button onclick="refreshBalance()" style="margin-left:8px;">Refresh Balance</button>
+      <span id="usdcBalance" class="padding-bottom: 8px;">USDC Balance: <span id="usdcBalanceValue">-</span></span>
+      <button onclick="refreshBalance()" class="margin-top: 8px;" >Refresh Balance</button>
     </div>
     <div id="totalSavedSection" style="margin-top:12px; color:#6f6; font-size:0.95em;">
       Total saved: $<span id="totalSavedValue">0.000000</span>
@@ -122,7 +154,9 @@
       });
       document.getElementById('fixActions').style.display = 'none';
       showLoadingSequence();
-      vscode.postMessage({ type: 'fix-request' });
+      // Get selected context window
+      const contextWindow = document.querySelector('input[name="contextWindow"]:checked').value;
+      vscode.postMessage({ type: 'fix-request', contextWindow });
     }
 
     function formatSimpleDiff(original, fixed) {
@@ -148,7 +182,7 @@
     }
 
     function setWalletInfo(address, usdcBalance) {
-      document.getElementById('walletAddress').innerText = address ? `Address: ${address}` : '';
+      document.getElementById('walletAddress').innerText = address ? `Address:\n ${address.slice(0, 6)}...${address.slice(-4)}\n` : '';
       document.getElementById('usdcBalanceValue').innerText = usdcBalance !== undefined ? usdcBalance : '-';
     }
     function refreshBalance() {
@@ -160,7 +194,10 @@
       if (msg.type === 'show-diff') {
         hideLoading();
         document.getElementById('filename').innerText = msg.filename || '';
-        document.getElementById('contextInfo').innerText = `Model: ${msg.model} | Context: ${msg.contextType}`;
+        document.getElementById('contextInfo').style.display = '';
+        document.getElementById('savingsInfo').style.display = '';
+        document.getElementById('subscriptionComparison').style.display = '';
+        document.getElementById('priceInfo').innerText = (msg.price !== undefined) ? `Price: $${Number(msg.price).toFixed(6)}` : '';
         fixedCode = msg.fixed;
         document.getElementById('diff').innerHTML = formatSimpleDiff(msg.original, msg.fixed);
         document.getElementById('diff').style.display = 'block';
@@ -204,8 +241,20 @@
       }
     });
 
-    function applyFix() { vscode.postMessage({ type: 'apply-fix', fixed: fixedCode }); }
-    function rejectFix() { document.getElementById('diff').style.display = 'none'; document.getElementById('diffActions').style.display = 'none'; document.getElementById('fixActions').style.display = 'flex'; }
+    function applyFix() {
+      vscode.postMessage({ type: 'apply-fix', fixed: fixedCode });
+      document.getElementById('contextInfo').style.display = 'none';
+      document.getElementById('savingsInfo').style.display = 'none';
+      document.getElementById('subscriptionComparison').style.display = 'none';
+    }
+    function rejectFix() {
+      document.getElementById('diff').style.display = 'none';
+      document.getElementById('diffActions').style.display = 'none';
+      document.getElementById('fixActions').style.display = 'flex';
+      document.getElementById('contextInfo').style.display = 'none';
+      document.getElementById('savingsInfo').style.display = 'none';
+      document.getElementById('subscriptionComparison').style.display = 'none';
+    }
 
     function onSetPrivateKey() {
       let pk = document.getElementById('privateKeyInput').value.trim();

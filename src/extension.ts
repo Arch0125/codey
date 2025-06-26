@@ -177,7 +177,7 @@ export function activate(context: vscode.ExtensionContext) {
               for (let i = start; i <= end; i++) lines.push(doc.lineAt(i).text);
               return lines.join('\n');
             }
-            // --- Context selection logic based on complexity ---
+            // --- Context selection logic based on user selection ---
             function estimateTokens(text: string): number {
               return Math.ceil(text.split(/\s+/).length * 1.3);
             }
@@ -187,18 +187,21 @@ export function activate(context: vscode.ExtensionContext) {
             function getWholeFile(editor: vscode.TextEditor): string {
               return editor.document.getText();
             }
-            const tokenCount = estimateTokens(code);
+            // Use the contextWindow value from the webview message
             let contextCode = code;
             let contextType = 'selection';
-            if (tokenCount <= 50) {
+            if (message.contextWindow === 'line') {
               contextCode = getLine(editor, selection);
               contextType = 'line';
-            } else if (tokenCount <= 300) {
+            } else if (message.contextWindow === 'function') {
               contextCode = getFunctionOrClass(editor, selection);
               contextType = 'function/class';
-            } else {
+            } else if (message.contextWindow === 'file') {
               contextCode = getWholeFile(editor);
               contextType = 'file';
+            } else {
+              contextCode = code;
+              contextType = 'selection';
             }
             // --- Model selection logic ---
             const models = [
@@ -210,12 +213,9 @@ export function activate(context: vscode.ExtensionContext) {
             let candidates = models.filter(m => contextTokens < m.maxTokens);
             let selectedModel = candidates.sort((a, b) => a.cost - b.cost)[0] || models[models.length-1];
             // --- Context window safety ---
-            // If context is too large, fallback to larger model or trim
             if (!candidates.length) {
-              // Try largest model
               selectedModel = models[models.length-1];
               if (contextTokens >= selectedModel.maxTokens) {
-                // Trim context
                 if (typeof contextCode === 'string') {
                   const words = contextCode.split(/\s+/);
                   contextCode = words.slice(0, Math.floor(selectedModel.maxTokens/1.3)).join(' ');
@@ -235,6 +235,12 @@ export function activate(context: vscode.ExtensionContext) {
                 `Fix and improve this ${language} function or class. Return only the fixed code, nothing else:\n${contextCode}` :
                 `Fix and improve this ${language} file. Return only the fixed file, nothing else:\n${contextCode}`;
             // --- End prompt construction ---
+            // --- Price calculation based on context tokens ---
+            // Use the per-token cost of the selected model, and assume 750 tokens per $0.001 for gpt-3.5-turbo, etc.
+            // We'll use a simple proportional calculation: price = (contextTokens / model.maxTokens) * model.cost
+            // Or, more accurately, price = contextTokens * (model.cost / model.maxTokens)
+            let price = Number((contextTokens * (selectedModel.cost / selectedModel.maxTokens)).toFixed(6));
+            if (price < 0.0001) price = 0.0001; // minimum price
             // --- Error handling and retry logic ---
             async function callOpenAI(model: string, prompt: string, price: number) {
               if (!currentApi) {
@@ -251,14 +257,14 @@ export function activate(context: vscode.ExtensionContext) {
             }
             let response;
             try {
-              response = await callOpenAI(selectedModel.name, prompt, selectedModel.cost);
+              response = await callOpenAI(selectedModel.name, prompt, price);
             } catch (err: any) {
               // If context length error, try next bigger model or trim
               if (err?.response?.data?.error?.message?.includes('maximum context length')) {
                 if (selectedModel.name !== models[models.length-1].name) {
                   // Try largest model
                   selectedModel = models[models.length-1];
-                  response = await callOpenAI(selectedModel.name, prompt, selectedModel.cost);
+                  response = await callOpenAI(selectedModel.name, prompt, price);
                 } else {
                   // Trim context and retry
                   if (typeof contextCode === 'string') {
@@ -273,7 +279,7 @@ export function activate(context: vscode.ExtensionContext) {
                     contextType === 'function/class' ?
                       `Fix and improve this ${language} function or class. Return only the fixed code, nothing else:\n${contextCode}` :
                       `Fix and improve this ${language} file. Return only the fixed file, nothing else:\n${contextCode}`;
-                  response = await callOpenAI(selectedModel.name, newPrompt, selectedModel.cost);
+                  response = await callOpenAI(selectedModel.name, newPrompt, price);
                 }
               } else {
                 webviewView.webview.postMessage({ type: 'fix-error', error: err.message });
@@ -282,7 +288,7 @@ export function activate(context: vscode.ExtensionContext) {
             }
             const fixedRaw = response.data.choices?.[0]?.message?.content || '';
             const fixed = cleanCodeBlock(fixedRaw);
-            webviewView.webview.postMessage({ type: 'show-diff', original: code, fixed, filename: editor.document.fileName.split(/[\\\/]/).pop(), model: selectedModel.name, contextType });
+            webviewView.webview.postMessage({ type: 'show-diff', original: code, fixed, filename: editor.document.fileName.split(/[\\\/]/).pop(), model: selectedModel.name, contextType, price });
           }
           if (message.type === 'apply-fix') {
             if (lastEditor && lastSelection && typeof message.fixed === 'string') {
