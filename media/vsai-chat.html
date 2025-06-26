@@ -58,11 +58,32 @@
       color: #b3ffb3;
       display: block;
     }
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 3px solid #444;
+      border-top: 3px solid #eee;
+      border-radius: 50%;
+      display: inline-block;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="filename" id="filename"></div>
+    <div id="contextInfo" style="font-size:0.95em;color:#aaa;margin-bottom:8px;"></div>
+    <div id="savingsInfo" style="font-size:0.95em;color:#6f6;margin-bottom:8px;"></div>
+    <div id="subscriptionComparison" style="font-size:0.95em;color:#6f6;white-space:pre-wrap;margin-bottom:8px;"></div>
+
+    <div id="loading" style="display:none;align-items:center;gap:10px;margin:16px 0;">
+      <span class="spinner"></span>
+      <span id="loadingMsg">Loading...</span>
+    </div>
     <div class="actions" id="fixActions">
       <button onclick="onFixClick()">Fix Selected Code</button>
     </div>
@@ -76,63 +97,85 @@
   <script>
     const vscode = acquireVsCodeApi();
     let fixedCode = '';
+
     function onFixClick() {
-      document.getElementById('diff').style.display = 'none';
-      document.getElementById('diffActions').style.display = 'none';
+      ['diff','contextInfo','savingsInfo','subscriptionComparison','diffActions'].forEach(id => {
+        const el = document.getElementById(id);
+        if (id === 'diff' || id === 'diffActions') el.style.display = 'none';
+        else el.innerText = '';
+      });
       document.getElementById('fixActions').style.display = 'none';
-      document.getElementById('filename').innerText = '';
+      showLoadingSequence();
       vscode.postMessage({ type: 'fix-request' });
     }
+
     function formatSimpleDiff(original, fixed) {
       const diff = Diff.diffLines(original, fixed);
-      let html = '';
-      diff.forEach(part => {
-        if (part.removed) {
-          part.value.split('\n').forEach(line => {
-            if (line) html += `<span class='removed-line'>- ${line}</span>\n`;
-          });
-        } else if (part.added) {
-          part.value.split('\n').forEach(line => {
-            if (line) html += `<span class='added-line'>+ ${line}</span>\n`;
-          });
-        } else {
-          part.value.split('\n').forEach(line => {
-            if (line) html += line + '\n';
-          });
-        }
-      });
-      return html;
+      return diff.map(part => {
+        const prefix = part.removed ? '- ' : part.added ? '+ ' : '';
+        const cls = part.removed ? 'removed-line' : part.added ? 'added-line' : '';
+        return part.value.split('\n').filter(line => line).map(line => cls ? `<span class='${cls}'>${prefix}${line}</span>` : line).join('\n');
+      }).join('\n');
     }
+
+    const loadingSteps = ['Choosing model...','Creating context...','Contacting AI...','Waiting for response...'];
+    function showLoadingSequence() {
+      const loadingDiv = document.getElementById('loading');
+      loadingDiv.style.display = 'flex';
+      loadingSteps.reduce((delay, msg) => {
+        setTimeout(() => document.getElementById('loadingMsg').innerText = msg, delay);
+        return delay + 600;
+      }, 0);
+    }
+    function hideLoading() {
+      document.getElementById('loading').style.display = 'none';
+    }
+
     window.addEventListener('message', event => {
-      const message = event.data;
-      if (message.type === 'show-diff') {
-        document.getElementById('filename').innerText = message.filename || '';
-        fixedCode = message.fixed;
-        document.getElementById('diff').innerHTML = formatSimpleDiff(message.original, message.fixed);
+      const msg = event.data;
+      if (msg.type === 'show-diff') {
+        hideLoading();
+        document.getElementById('filename').innerText = msg.filename || '';
+        document.getElementById('contextInfo').innerText = `Model: ${msg.model} | Context: ${msg.contextType}`;
+        fixedCode = msg.fixed;
+        document.getElementById('diff').innerHTML = formatSimpleDiff(msg.original, msg.fixed);
         document.getElementById('diff').style.display = 'block';
         document.getElementById('diffActions').style.display = 'flex';
-        document.getElementById('fixActions').style.display = 'none';
+
+        // compute costs
+        const estimateTokens = text => Math.ceil(text.split(/\s+/).length * 1.3);
+        const modelPrices = { 'gpt-3.5-turbo': 0.0005, 'gpt-3.5-turbo-16k': 0.001, 'gpt-4-turbo': 0.01, 'o4-mini-high': 0.00193, 'gpt-4o': 0.02 };
+        const usedTokens = estimateTokens(document.getElementById('diff').innerText);
+        const cost = (usedTokens / 1000) * (modelPrices[msg.model] || modelPrices['gpt-3.5-turbo']);
+        const fullCostGPT4 = (usedTokens * 3 / 1000) * modelPrices['gpt-4-turbo'];
+        const saved = Math.max(fullCostGPT4 - cost, 0);
+        let comparisonText = `You saved ~$${saved.toFixed(4)} vs full-file GPT-4 Turbo! 🎉`;
+
+        // compare to ChatGPT Plus subscription
+        const subscriptionCost = 20.00;
+        const diffSub = subscriptionCost - cost;
+        comparisonText += `\nCompared to ChatGPT Plus ($${subscriptionCost.toFixed(2)}/mo), you saved ~$${diffSub.toFixed(4)} this session! 🎉`;
+
+        // compare to SOTA API models on full context
+        const sotaModels = ['o4-mini-high', 'gpt-4o'];
+        sotaModels.forEach(m => {
+          const fullCost = (usedTokens * 3 / 1000) * modelPrices[m];
+          const diffModel = fullCost - cost;
+          if (diffModel > 0) comparisonText += `\nSaved ~$${diffModel.toFixed(4)} vs ${m} full-file context`;
+          else comparisonText += `\nCost $${cost.toFixed(4)} exceeds ${m} full-file context ($${fullCost.toFixed(4)})`;
+        });
+
+        document.getElementById('subscriptionComparison').innerText = comparisonText;
       }
-      if (message.type === 'fix-applied') {
-        document.getElementById('diff').style.display = 'none';
-        document.getElementById('diffActions').style.display = 'none';
-        document.getElementById('fixActions').style.display = 'flex';
-      }
-      if (message.type === 'fix-error') {
-        alert('Error applying fix: ' + message.error);
-        document.getElementById('diff').style.display = 'none';
-        document.getElementById('diffActions').style.display = 'none';
+      if (msg.type === 'fix-applied' || msg.type === 'fix-error') {
+        hideLoading();
+        ['diff','diffActions'].forEach(id => document.getElementById(id).style.display = 'none');
         document.getElementById('fixActions').style.display = 'flex';
       }
     });
-    function applyFix() {
-      vscode.postMessage({ type: 'apply-fix', fixed: fixedCode });
-    }
-    function rejectFix() {
-      document.getElementById('diff').style.display = 'none';
-      document.getElementById('diffActions').style.display = 'none';
-      document.getElementById('fixActions').style.display = 'flex';
-    }
+
+    function applyFix() { vscode.postMessage({ type: 'apply-fix', fixed: fixedCode }); }
+    function rejectFix() { document.getElementById('diff').style.display = 'none'; document.getElementById('diffActions').style.display = 'none'; document.getElementById('fixActions').style.display = 'flex'; }
   </script>
 </body>
 </html>
