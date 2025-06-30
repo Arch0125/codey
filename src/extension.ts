@@ -75,6 +75,10 @@ export function activate(context: vscode.ExtensionContext) {
         let lastSelection: vscode.Selection | undefined;
         let lastEditor: vscode.TextEditor | undefined;
         let lastOriginal: string | undefined;
+        let lastContextType: string | undefined;
+        let lastContextSelection: vscode.Selection | undefined;
+        let lastUserSelection: vscode.Selection | undefined;
+        let lastReplaceRange: vscode.Range | undefined;
 
         // --- Clean model output to remove markdown code blocks ---
         function cleanCodeBlock(output: string): string {
@@ -110,14 +114,10 @@ export function activate(context: vscode.ExtensionContext) {
                 selection.end.line, editor.document.lineAt(selection.end.line).text.length
               );
             }
-            const code = editor.document.getText(selection);
-            if (!code.trim()) {
-              webviewView.webview.postMessage({ type: 'fix-error', error: 'No code selected.' });
-              return;
-            }
+            lastUserSelection = selection;
             lastSelection = selection;
             lastEditor = editor;
-            lastOriginal = code;
+            lastContextSelection = selection;
             // --- Language detection ---
             function detectLanguage(editor: vscode.TextEditor): string {
               const ext = editor.document.fileName.split('.').pop()?.toLowerCase() || '';
@@ -134,6 +134,48 @@ export function activate(context: vscode.ExtensionContext) {
               return ext;
             }
             const language = detectLanguage(editor);
+            // --- Extract diagnostics (errors/warnings) for the selected code ---
+            let diagnosticsText = '';
+            let replaceRange: vscode.Range = new vscode.Range(selection.start, selection.end);
+            let code = editor.document.getText(selection);
+            try {
+              const diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
+              // Only include diagnostics that overlap with the selection/context
+              const relevantDiagnostics = diagnostics.filter(diag => {
+                const diagStart = diag.range.start;
+                const diagEnd = diag.range.end;
+                const selStart = selection.start;
+                const selEnd = selection.end;
+                // Check for overlap
+                return (
+                  (diagStart.line < selEnd.line || (diagStart.line === selEnd.line && diagStart.character <= selEnd.character)) &&
+                  (diagEnd.line > selStart.line || (diagEnd.line === selStart.line && diagEnd.character >= selStart.character))
+                );
+              });
+              if (relevantDiagnostics.length > 0) {
+                // Expand to full lines containing the first diagnostic
+                const diag = relevantDiagnostics[0];
+                const startLine = diag.range.start.line;
+                const endLine = diag.range.end.line;
+                replaceRange = new vscode.Range(
+                  new vscode.Position(startLine, 0),
+                  new vscode.Position(endLine, editor.document.lineAt(endLine).text.length)
+                );
+                code = editor.document.getText(replaceRange);
+                diagnosticsText = '\n\nKnown errors/warnings in this code:';
+                for (const diag of relevantDiagnostics) {
+                  diagnosticsText += `\n- [${diag.severity === 0 ? 'Error' : diag.severity === 1 ? 'Warning' : 'Info'}] ${diag.message}`;
+                }
+              }
+            } catch (e) {
+              // Ignore diagnostics errors
+            }
+            lastReplaceRange = replaceRange;
+            if (!code.trim()) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'No code selected.' });
+              return;
+            }
+            lastOriginal = code;
             // --- Improved function/class extraction ---
             function getFunctionOrClass(editor: vscode.TextEditor, selection: vscode.Selection): string {
               const doc = editor.document;
@@ -193,32 +235,76 @@ export function activate(context: vscode.ExtensionContext) {
             if (message.contextWindow === 'line') {
               contextCode = getLine(editor, selection);
               contextType = 'line';
+              lastContextSelection = new vscode.Selection(selection.start.line, 0, selection.start.line, editor.document.lineAt(selection.start.line).text.length);
             } else if (message.contextWindow === 'function') {
               contextCode = getFunctionOrClass(editor, selection);
               contextType = 'function/class';
+              // Find the function/class selection range
+              const doc = editor.document;
+              const totalLines = doc.lineCount;
+              let start = selection.start.line;
+              let end = selection.end.line;
+              let foundClass = false;
+              let foundFunc = false;
+              let classStart = -1;
+              let funcStart = -1;
+              for (let i = start; i >= 0; i--) {
+                const line = doc.lineAt(i).text;
+                if (/\b(class\s+\w+)/.test(line)) { foundClass = true; classStart = i; break; }
+                if (/\b(function|def|\w+\s*\()/.test(line)) { foundFunc = true; funcStart = i; break; }
+              }
+              if (foundClass) {
+                start = classStart;
+                let baseIndent = doc.lineAt(start).firstNonWhitespaceCharacterIndex;
+                end = start;
+                for (let i = start + 1; i < totalLines; i++) {
+                  const line = doc.lineAt(i).text;
+                  if (!line.trim()) break;
+                  if (doc.lineAt(i).firstNonWhitespaceCharacterIndex < baseIndent) break;
+                  end = i;
+                }
+              } else if (foundFunc) {
+                start = funcStart;
+                let baseIndent = doc.lineAt(start).firstNonWhitespaceCharacterIndex;
+                end = Math.max(end, start);
+                for (let i = end + 1; i < totalLines; i++) {
+                  const line = doc.lineAt(i).text;
+                  if (!line.trim()) break;
+                  if (doc.lineAt(i).firstNonWhitespaceCharacterIndex < baseIndent) break;
+                  end = i;
+                }
+              }
+              lastContextSelection = new vscode.Selection(start, 0, end, doc.lineAt(end).text.length);
             } else if (message.contextWindow === 'file') {
               contextCode = getWholeFile(editor);
               contextType = 'file';
+              lastContextSelection = new vscode.Selection(0, 0, editor.document.lineCount - 1, editor.document.lineAt(editor.document.lineCount - 1).text.length);
             } else {
               contextCode = code;
               contextType = 'selection';
+              lastContextSelection = selection;
             }
+            lastContextType = contextType;
             // --- Model selection logic ---
+            // Expanded model list with accuracy and cost trade-off
             const models = [
-              { name: 'gpt-3.5-turbo', maxTokens: 4096, cost: 0.0005 },
-              { name: 'gpt-3.5-turbo-16k', maxTokens: 16384, cost: 0.001 },
-              { name: 'gpt-4-turbo', maxTokens: 128000, cost: 0.01 }
+              { name: 'gpt-3.5-turbo', maxTokens: 4096, cost: 0.0005, accuracy: 1 },
+              { name: 'gpt-3.5-turbo-16k', maxTokens: 16384, cost: 0.001, accuracy: 1 },
+              { name: 'gpt-4', maxTokens: 8192, cost: 0.03, accuracy: 3 },
+              { name: 'gpt-4-32k', maxTokens: 32768, cost: 0.06, accuracy: 3 },
+              { name: 'gpt-4-turbo', maxTokens: 128000, cost: 0.01, accuracy: 2.5 },
+              { name: 'gpt-4o', maxTokens: 128000, cost: 0.02, accuracy: 3.5 },
+              { name: 'o4-mini-high', maxTokens: 128000, cost: 0.00193, accuracy: 2 },
             ];
             let contextTokens = estimateTokens(contextCode);
             let candidates = models.filter(m => contextTokens < m.maxTokens);
-            let selectedModel = candidates.sort((a, b) => a.cost - b.cost)[0] || models[models.length-1];
-            // --- Context window safety ---
+            // If no model fits, use the largest
             if (!candidates.length) {
-              selectedModel = models[models.length-1];
-              if (contextTokens >= selectedModel.maxTokens) {
+              candidates = [models[models.length-1]];
+              if (contextTokens >= candidates[0].maxTokens) {
                 if (typeof contextCode === 'string') {
                   const words = contextCode.split(/\s+/);
-                  contextCode = words.slice(0, Math.floor(selectedModel.maxTokens/1.3)).join(' ');
+                  contextCode = words.slice(0, Math.floor(candidates[0].maxTokens/1.3)).join(' ');
                   contextTokens = estimateTokens(contextCode);
                 } else {
                   contextCode = '';
@@ -226,14 +312,21 @@ export function activate(context: vscode.ExtensionContext) {
                 }
               }
             }
+            // Sort by cost, but if a higher-accuracy model is within 20% cost, prefer it
+            candidates.sort((a, b) => a.cost - b.cost);
+            let selectedModel = candidates[0];
+            for (let i = candidates.length - 1; i > 0; i--) {
+              const cheaper = candidates[0];
+              const better = candidates[i];
+              if (better.accuracy > cheaper.accuracy && (better.cost / cheaper.cost) <= 1.2) {
+                selectedModel = better;
+                break;
+              }
+            }
             // --- End model selection logic ---
             // --- Prompt construction ---
             const prompt =
-              contextType === 'line' ?
-                `Fix and improve this line of ${language} code. Return only the fixed line, nothing else:\n${contextCode}` :
-              contextType === 'function/class' ?
-                `Fix and improve this ${language} function or class. Return only the fixed code, nothing else:\n${contextCode}` :
-                `Fix and improve this ${language} file. Return only the fixed file, nothing else:\n${contextCode}`;
+              `Fix and improve the following ${language} code. Return only the fixed version of these lines, and nothing else. Do not repeat the rest of the code.\n${code}${diagnosticsText}`;
             // --- End prompt construction ---
             // --- Price calculation based on context tokens ---
             // Use the per-token cost of the selected model, and assume 750 tokens per $0.001 for gpt-3.5-turbo, etc.
@@ -274,11 +367,7 @@ export function activate(context: vscode.ExtensionContext) {
                     contextCode = '';
                   }
                   const newPrompt =
-                    contextType === 'line' ?
-                      `Fix and improve this line of ${language} code. Return only the fixed line, nothing else:\n${contextCode}` :
-                    contextType === 'function/class' ?
-                      `Fix and improve this ${language} function or class. Return only the fixed code, nothing else:\n${contextCode}` :
-                      `Fix and improve this ${language} file. Return only the fixed file, nothing else:\n${contextCode}`;
+                    `Fix and improve the following ${language} code. Return only the fixed version of these lines, and nothing else. Do not repeat the rest of the code.\n${contextCode}${diagnosticsText}`;
                   response = await callOpenAI(selectedModel.name, newPrompt, price);
                 }
               } else {
@@ -291,13 +380,49 @@ export function activate(context: vscode.ExtensionContext) {
             webviewView.webview.postMessage({ type: 'show-diff', original: code, fixed, filename: editor.document.fileName.split(/[\\\/]/).pop(), model: selectedModel.name, contextType, price });
           }
           if (message.type === 'apply-fix') {
-            if (lastEditor && lastSelection && typeof message.fixed === 'string') {
-              lastEditor.edit(editBuilder => {
-                editBuilder.replace(lastSelection!, message.fixed);
-              });
-              webviewView.webview.postMessage({ type: 'fix-applied' });
-            } else {
-              webviewView.webview.postMessage({ type: 'fix-error', error: 'No selection to apply fix.' });
+            if (!lastEditor) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'No active editor to apply fix.' });
+              return;
+            }
+            if (!lastReplaceRange) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'No range to apply fix.' });
+              return;
+            }
+            if (typeof message.fixed !== 'string') {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'No fixed code provided.' });
+              return;
+            }
+            // Validate selection bounds
+            const doc = lastEditor.document;
+            const startLine = lastReplaceRange.start.line;
+            const endLine = lastReplaceRange.end.line;
+            if (startLine < 0 || endLine >= doc.lineCount || startLine > endLine) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'Invalid range for replacement.' });
+              return;
+            }
+            // Ensure selection is not empty
+            if (startLine === endLine && lastReplaceRange.start.character === lastReplaceRange.end.character) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'Empty range. Nothing to replace.' });
+              return;
+            }
+            // Trim whitespace from the fixed code to avoid accidental appending
+            const trimmedFixed = message.fixed.trim();
+            try {
+              if (lastReplaceRange) {
+                lastEditor.edit(editBuilder => {
+                  editBuilder.replace(lastReplaceRange as vscode.Range, trimmedFixed);
+                }).then(success => {
+                  if (success) {
+                    webviewView.webview.postMessage({ type: 'fix-applied' });
+                  } else {
+                    webviewView.webview.postMessage({ type: 'fix-error', error: 'Failed to apply fix to the document.' });
+                  }
+                });
+              } else {
+                webviewView.webview.postMessage({ type: 'fix-error', error: 'No valid range to apply fix.' });
+              }
+            } catch (e: any) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: 'Exception during replacement: ' + (e?.message || e) });
             }
           }
           if (message.type === 'get-wallet-info') {
