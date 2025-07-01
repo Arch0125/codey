@@ -285,6 +285,33 @@ export function activate(context: vscode.ExtensionContext) {
               lastContextSelection = selection;
             }
             lastContextType = contextType;
+
+            // --- Extra context step: summarize full file with cheap model if not 'file' context ---
+            let extraContext = '';
+            if (contextType !== 'file') {
+              const fullFile = getWholeFile(editor);
+              const cheapModel = 'gpt-3.5-turbo';
+              const cheapPrompt = `Summarize the following ${language} code. Focus on key functions, classes, dependencies, and any context that would help fix a bug in a selected part. Be concise and only include what's needed.\n\nCODE:\n${fullFile}`;
+              // Use a small price for the summary step
+              const cheapPrice = 0.0002;
+              try {
+                const cheapResponse = await (async function callOpenAI(model: string, prompt: string, price: number) {
+                  if (!currentApi) {
+                    throw new Error('No private key set. Please set your private key in the Wallet Settings.');
+                  }
+                  const response = await currentApi.post(endpointPath, {
+                    model,
+                    prompt,
+                    price
+                  });
+                  return response;
+                })(cheapModel, cheapPrompt, cheapPrice);
+                extraContext = cleanCodeBlock(cheapResponse.data.choices?.[0]?.message?.content || '');
+              } catch (e) {
+                // If summary fails, just skip extra context
+                extraContext = '';
+              }
+            }
             // --- Model selection logic ---
             // Expanded model list with accuracy and cost trade-off
             const models = [
@@ -326,6 +353,7 @@ export function activate(context: vscode.ExtensionContext) {
             // --- End model selection logic ---
             // --- Prompt construction ---
             const prompt =
+              `${extraContext ? `Relevant context for the code:\n${extraContext}\n\n` : ''}` +
               `Fix and improve the following ${language} code. Return only the fixed version of these lines, and nothing else. Do not repeat the rest of the code.\n${code}${diagnosticsText}`;
             // --- End prompt construction ---
             // --- Price calculation based on context tokens ---
