@@ -136,7 +136,8 @@ export function activate(context: vscode.ExtensionContext) {
             const language = detectLanguage(editor);
             // --- Extract diagnostics (errors/warnings) for the selected code ---
             let diagnosticsText = '';
-            let replaceRange: vscode.Range = new vscode.Range(selection.start, selection.end);
+            let replaceRanges: vscode.Range[] = [];
+            let codeBlocks: string[] = [];
             let code = editor.document.getText(selection);
             try {
               const diagnostics = vscode.languages.getDiagnostics(editor.document.uri);
@@ -153,24 +154,41 @@ export function activate(context: vscode.ExtensionContext) {
                 );
               });
               if (relevantDiagnostics.length > 0) {
-                // Expand to full lines containing the first diagnostic
-                const diag = relevantDiagnostics[0];
-                const startLine = diag.range.start.line;
-                const endLine = diag.range.end.line;
-                replaceRange = new vscode.Range(
-                  new vscode.Position(startLine, 0),
-                  new vscode.Position(endLine, editor.document.lineAt(endLine).text.length)
+                // Collect all full-line ranges for each diagnostic
+                replaceRanges = relevantDiagnostics.map(diag => {
+                  const startLine = diag.range.start.line;
+                  const endLine = diag.range.end.line;
+                  return new vscode.Range(
+                    new vscode.Position(startLine, 0),
+                    new vscode.Position(endLine, editor.document.lineAt(endLine).text.length)
+                  );
+                });
+                // Remove duplicate/overlapping ranges
+                replaceRanges = replaceRanges.filter((range, idx, arr) =>
+                  arr.findIndex(r => r.start.line === range.start.line && r.end.line === range.end.line) === idx
                 );
-                code = editor.document.getText(replaceRange);
+                // Sort by start line
+                replaceRanges.sort((a, b) => a.start.line - b.start.line);
+                codeBlocks = replaceRanges.map(range => editor.document.getText(range));
+                code = codeBlocks.join('\n---BLOCK---\n');
                 diagnosticsText = '\n\nKnown errors/warnings in this code:';
                 for (const diag of relevantDiagnostics) {
                   diagnosticsText += `\n- [${diag.severity === 0 ? 'Error' : diag.severity === 1 ? 'Warning' : 'Info'}] ${diag.message}`;
                 }
+              } else {
+                // Fallback: single range as before
+                replaceRanges = [new vscode.Range(selection.start, selection.end)];
+                codeBlocks = [code];
               }
             } catch (e) {
               // Ignore diagnostics errors
+              replaceRanges = [new vscode.Range(selection.start, selection.end)];
+              codeBlocks = [code];
             }
-            lastReplaceRange = replaceRange;
+            lastReplaceRange = replaceRanges.length === 1 ? replaceRanges[0] : undefined;
+            // Store all ranges for multi-block replacement
+            (globalThis as any).vsai_lastReplaceRanges = replaceRanges;
+            (globalThis as any).vsai_lastCodeBlocks = codeBlocks;
             if (!code.trim()) {
               webviewView.webview.postMessage({ type: 'fix-error', error: 'No code selected.' });
               return;
@@ -354,7 +372,7 @@ export function activate(context: vscode.ExtensionContext) {
             // --- Prompt construction ---
             const prompt =
               `${extraContext ? `Relevant context for the code:\n${extraContext}\n\n` : ''}` +
-              `Fix and improve the following ${language} code. Return only the fixed version of these lines, and nothing else. Do not repeat the rest of the code.\n${code}${diagnosticsText}`;
+              `Fix and improve the following ${language} code. For each code block below, return only the fixed version of that block, in the same order, separated by a line with only '---BLOCK---'. Do not repeat the rest of the code.\n\nCODE BLOCKS (fix each, keep order, use delimiter):\n${code}${diagnosticsText}`;
             // --- End prompt construction ---
             // --- Price calculation based on context tokens ---
             // Use the per-token cost of the selected model, and assume 750 tokens per $0.001 for gpt-3.5-turbo, etc.
@@ -412,7 +430,9 @@ export function activate(context: vscode.ExtensionContext) {
               webviewView.webview.postMessage({ type: 'fix-error', error: 'No active editor to apply fix.' });
               return;
             }
-            if (!lastReplaceRange) {
+            // Support multiple replace ranges
+            let replaceRanges: vscode.Range[] = (globalThis as any).vsai_lastReplaceRanges || (lastReplaceRange ? [lastReplaceRange] : []);
+            if (!replaceRanges.length) {
               webviewView.webview.postMessage({ type: 'fix-error', error: 'No range to apply fix.' });
               return;
             }
@@ -420,35 +440,24 @@ export function activate(context: vscode.ExtensionContext) {
               webviewView.webview.postMessage({ type: 'fix-error', error: 'No fixed code provided.' });
               return;
             }
-            // Validate selection bounds
-            const doc = lastEditor.document;
-            const startLine = lastReplaceRange.start.line;
-            const endLine = lastReplaceRange.end.line;
-            if (startLine < 0 || endLine >= doc.lineCount || startLine > endLine) {
-              webviewView.webview.postMessage({ type: 'fix-error', error: 'Invalid range for replacement.' });
+            // Split fixed code by delimiter for multi-block replacement
+            const fixedBlocks = message.fixed.split(/\n+---BLOCK---\n+/).map((s: string) => s.trim());
+            if (fixedBlocks.length !== replaceRanges.length) {
+              webviewView.webview.postMessage({ type: 'fix-error', error: `Mismatch: got ${fixedBlocks.length} blocks, expected ${replaceRanges.length}.` });
               return;
             }
-            // Ensure selection is not empty
-            if (startLine === endLine && lastReplaceRange.start.character === lastReplaceRange.end.character) {
-              webviewView.webview.postMessage({ type: 'fix-error', error: 'Empty range. Nothing to replace.' });
-              return;
-            }
-            // Trim whitespace from the fixed code to avoid accidental appending
-            const trimmedFixed = message.fixed.trim();
             try {
-              if (lastReplaceRange) {
-                lastEditor.edit(editBuilder => {
-                  editBuilder.replace(lastReplaceRange as vscode.Range, trimmedFixed);
-                }).then(success => {
-                  if (success) {
-                    webviewView.webview.postMessage({ type: 'fix-applied' });
-                  } else {
-                    webviewView.webview.postMessage({ type: 'fix-error', error: 'Failed to apply fix to the document.' });
-                  }
-                });
-              } else {
-                webviewView.webview.postMessage({ type: 'fix-error', error: 'No valid range to apply fix.' });
-              }
+              lastEditor.edit(editBuilder => {
+                for (let i = 0; i < replaceRanges.length; ++i) {
+                  editBuilder.replace(replaceRanges[i], fixedBlocks[i]);
+                }
+              }).then(success => {
+                if (success) {
+                  webviewView.webview.postMessage({ type: 'fix-applied' });
+                } else {
+                  webviewView.webview.postMessage({ type: 'fix-error', error: 'Failed to apply fix to the document.' });
+                }
+              });
             } catch (e: any) {
               webviewView.webview.postMessage({ type: 'fix-error', error: 'Exception during replacement: ' + (e?.message || e) });
             }
